@@ -52,6 +52,24 @@ func marshalUser(u database.User) User {
 	}
 }
 
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+func marshalChirp(c database.Chirp) Chirp {
+	return Chirp{
+		ID:        c.ID,
+		CreatedAt: c.CreatedAt,
+		UpdatedAt: c.UpdatedAt,
+		Body:      c.Body,
+		UserID:    c.UserID,
+	}
+}
+
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg.fileserverHits.Add(1)
@@ -84,29 +102,69 @@ func clean(chirp string) string {
 	return cleaned
 }
 
-func validateChirp(w http.ResponseWriter, r *http.Request) {
-	type Chirp struct {
-		Body string `json:"body"`
+func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
+	type CreateChirp struct {
+		Body   string    `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
-	chirp := Chirp{}
-	err := decoder.Decode(&chirp)
+	createChirp := CreateChirp{}
+	err := decoder.Decode(&createChirp)
 	if err != nil {
 		msg := fmt.Sprintf("Error decoding chirp: %s", err)
 		log.Print(msg)
 		respondWithError(w, http.StatusInternalServerError, msg)
 		return
 	}
-	if utf8.RuneCountInString(chirp.Body) > 140 {
+	if utf8.RuneCountInString(createChirp.Body) > 140 {
 		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
 		return
 	}
-	cleaned := clean(chirp.Body)
-	valid := map[string]any{
-		"cleaned_body": cleaned,
+	cleaned := clean(createChirp.Body)
+	params := database.CreateChirpParams{Body: cleaned, UserID: createChirp.UserID}
+	created, err := cfg.dbQueries.CreateChirp(r.Context(), params)
+	if err != nil {
+		msg := fmt.Sprintf("Error creating chirp: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
 	}
-	respondWithJSON(w, http.StatusOK, valid)
+	respondWithJSON(w, http.StatusCreated, marshalChirp(created))
+}
+
+func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
+	rawChirps, err := cfg.dbQueries.GetChirps(r.Context())
+	if err != nil {
+		msg := fmt.Sprintf("Error getting chirps: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+	chirps := make([]Chirp, 0, len(rawChirps))
+	for _, c := range rawChirps {
+		chirps = append(chirps, marshalChirp(c))
+	}
+	respondWithJSON(w, http.StatusOK, chirps)
+}
+
+func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
+	chirpID := r.PathValue("chirpID")
+	chirpUUID, err := uuid.Parse(chirpID)
+	if err != nil {
+		msg := fmt.Sprintf("Malformed chirp id: %s", chirpID)
+		log.Print(msg)
+		respondWithError(w, http.StatusNotFound, msg)
+		return
+	}
+	rawChirp, err := cfg.dbQueries.GetChirp(r.Context(), chirpUUID)
+	if err != nil {
+		msg := fmt.Sprintf("Error getting chirp %s: %s", chirpID, err)
+		log.Print(msg)
+		respondWithError(w, http.StatusNotFound, msg)
+		return
+	}
+	respondWithJSON(w, http.StatusOK, marshalChirp(rawChirp))
 }
 
 func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
@@ -200,7 +258,9 @@ func main() {
 	mux.Handle("/app/", cfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
 
 	mux.HandleFunc("GET /api/healthz", healthz)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
+	mux.HandleFunc("POST /api/chirps", cfg.createChirp)
+	mux.HandleFunc("GET /api/chirps", cfg.getChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirp)
 	mux.HandleFunc("POST /api/users", cfg.createUser)
 
 	mux.Handle("GET /admin/metrics", cfg.metrics())
