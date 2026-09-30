@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,7 +19,8 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 
-	"internal/database"
+	"github.com/cfr/chirpy/internal/auth"
+	"github.com/cfr/chirpy/internal/database"
 )
 
 var profanityRegexes = []*regexp.Regexp{
@@ -30,6 +33,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
 	platform       string
+	secret         string
 }
 
 type errorBody struct {
@@ -37,10 +41,12 @@ type errorBody struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 func marshalUser(u database.User) User {
@@ -104,13 +110,27 @@ func clean(chirp string) string {
 
 func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	type CreateChirp struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		msg := fmt.Sprintf("Error getting token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		msg := fmt.Sprintf("Error getting token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
 	}
 
 	decoder := json.NewDecoder(r.Body)
 	createChirp := CreateChirp{}
-	err := decoder.Decode(&createChirp)
+	err = decoder.Decode(&createChirp)
 	if err != nil {
 		msg := fmt.Sprintf("Error decoding chirp: %s", err)
 		log.Print(msg)
@@ -122,7 +142,7 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cleaned := clean(createChirp.Body)
-	params := database.CreateChirpParams{Body: cleaned, UserID: createChirp.UserID}
+	params := database.CreateChirpParams{Body: cleaned, UserID: userID}
 	created, err := cfg.dbQueries.CreateChirp(r.Context(), params)
 	if err != nil {
 		msg := fmt.Sprintf("Error creating chirp: %s", err)
@@ -167,29 +187,182 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, marshalChirp(rawChirp))
 }
 
+func (cfg *apiConfig) createTokens(ctx context.Context, user database.User) (User, error) {
+	token, err := auth.MakeJWT(user.ID, cfg.secret, time.Hour)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to create token: %s", err)
+		return User{}, errors.New(msg)
+	}
+	userWToken := marshalUser(user)
+	userWToken.Token = token
+	userWToken.RefreshToken = auth.MakeRefreshToken()
+
+	params := database.SaveRefreshTokenParams{
+		Token:     userWToken.RefreshToken,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().Add(time.Duration(24*60) * time.Hour),
+	}
+	_, err = cfg.dbQueries.SaveRefreshToken(ctx, params)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to save refresh token: %s", err)
+		log.Print(msg)
+		return User{}, errors.New(msg)
+	}
+	return userWToken, nil
+}
+
+func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
+	type Login struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	login := Login{}
+	err := decoder.Decode(&login)
+	if err != nil {
+		msg := fmt.Sprintf("Error decoding user credentials: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+
+	user, err := cfg.dbQueries.UserByEmail(r.Context(), login.Email)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to get user: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+
+	match, err := auth.CheckPasswordHash(login.Password, user.HashedPassword)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to hash password: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+	if !match {
+		msg := fmt.Sprintf("Wrong password fo user %s", user.Email)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+
+	userWTokens, err := cfg.createTokens(r.Context(), user)
+
+	if err != nil {
+		msg := fmt.Sprintf("Failed to create token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, userWTokens)
+}
+
 func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	type CreateUser struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
 	createUser := CreateUser{}
 	err := decoder.Decode(&createUser)
 	if err != nil {
-		msg := fmt.Sprintf("Error decoding user email: %s", err)
+		msg := fmt.Sprintf("Error decoding user credentials: %s", err)
 		log.Print(msg)
 		respondWithError(w, http.StatusInternalServerError, msg)
 		return
 	}
 
-	created, err := cfg.dbQueries.CreateUser(r.Context(), createUser.Email)
+	hash, err := auth.HashPassword(createUser.Password)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to hash password: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+
+	params := database.CreateUserParams{Email: createUser.Email, HashedPassword: hash}
+	created, err := cfg.dbQueries.CreateUser(r.Context(), params)
 	if err != nil {
 		msg := fmt.Sprintf("Error creating user: %s", err)
 		log.Print(msg)
 		respondWithError(w, http.StatusInternalServerError, msg)
 		return
 	}
-	respondWithJSON(w, http.StatusCreated, marshalUser(created))
+
+	// TODO: separate create user and login
+	userWTokens, err := cfg.createTokens(r.Context(), created)
+
+	if err != nil {
+		msg := fmt.Sprintf("Failed to create token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	respondWithJSON(w, http.StatusCreated, userWTokens)
+}
+
+func (cfg *apiConfig) refreshToken(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to get refresh token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	refresh, err := cfg.dbQueries.GetRefreshToken(r.Context(), refreshToken)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to get refresh token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	if time.Now().After(refresh.ExpiresAt) {
+		msg := fmt.Sprintf("Expired refresh token")
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	if refresh.RevokedAt.Valid {
+		msg := fmt.Sprintf("Revoked refresh token")
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	token, err := auth.MakeJWT(refresh.UserID, cfg.secret, time.Hour)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to create token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	type Token struct {
+		Token string `json:"token"`
+	}
+	body := Token{Token: token}
+	respondWithJSON(w, http.StatusOK, body)
+}
+
+func (cfg *apiConfig) revokeToken(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to get refresh token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	err = cfg.dbQueries.RevokeRefreshToken(r.Context(), refreshToken)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to revoke token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func healthz(w http.ResponseWriter, r *http.Request) {
@@ -248,10 +421,16 @@ func main() {
 		log.Fatalf("Error connecting to database: %s", err)
 	}
 
+	secret := os.Getenv("SECRET")
+	if secret == "" {
+		log.Fatal("SECRET must be set")
+	}
+
 	cfg := apiConfig{}
 	cfg.dbQueries = database.New(db)
 	cfg.fileserverHits.Store(0)
 	cfg.platform = os.Getenv("PLATFORM")
+	cfg.secret = secret
 
 	mux := http.NewServeMux()
 	mux.Handle("/app", cfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
@@ -262,6 +441,9 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", cfg.getChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirp)
 	mux.HandleFunc("POST /api/users", cfg.createUser)
+	mux.HandleFunc("POST /api/login", cfg.login)
+	mux.HandleFunc("POST /api/refresh", cfg.refreshToken)
+	mux.HandleFunc("POST /api/revoke", cfg.revokeToken)
 
 	mux.Handle("GET /admin/metrics", cfg.metrics())
 	mux.Handle("POST /admin/reset", cfg.reset())
