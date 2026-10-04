@@ -13,6 +13,10 @@ RETURNING *;
 SELECT * FROM chirps
 WHERE id = $1;
 
+-- name: DeleteChirp :execrows
+DELETE FROM chirps
+WHERE id = $1 AND user_id = $2;
+
 -- name: GetChirps :many
 SELECT * FROM chirps
 ORDER BY created_at ASC;

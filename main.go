@@ -45,8 +45,8 @@ type User struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	Email        string    `json:"email"`
-	Token        string    `json:"token"`
-	RefreshToken string    `json:"refresh_token"`
+	Token        string    `json:"token,omitempty"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
 }
 
 func marshalUser(u database.User) User {
@@ -122,7 +122,7 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	}
 	userID, err := auth.ValidateJWT(token, cfg.secret)
 	if err != nil {
-		msg := fmt.Sprintf("Error getting token: %s", err)
+		msg := fmt.Sprintf("Invalid token: %s", err)
 		log.Print(msg)
 		respondWithError(w, http.StatusUnauthorized, msg)
 		return
@@ -187,6 +187,55 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, marshalChirp(rawChirp))
 }
 
+func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
+	chirpID := r.PathValue("chirpID")
+	chirpUUID, err := uuid.Parse(chirpID)
+	if err != nil {
+		msg := fmt.Sprintf("Malformed chirp id: %s", chirpID)
+		log.Print(msg)
+		respondWithError(w, http.StatusNotFound, msg)
+		return
+	}
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		msg := fmt.Sprintf("Error getting token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		msg := fmt.Sprintf("Invalid token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+
+	_, err = cfg.dbQueries.GetChirp(r.Context(), chirpUUID)
+	if err != nil {
+		msg := fmt.Sprintf("Error getting chirp %s: %s", chirpID, err)
+		log.Print(msg)
+		respondWithError(w, http.StatusNotFound, msg)
+		return
+	}
+
+	deleteParams := database.DeleteChirpParams{ID: chirpUUID, UserID: userID}
+	rows, err := cfg.dbQueries.DeleteChirp(r.Context(), deleteParams)
+	if err != nil {
+		msg := fmt.Sprintf("Error deleting chirp %s: %s", chirpID, err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+	if rows == 0 {
+		msg := fmt.Sprintf("No matching chirps %s", chirpID)
+		log.Print(msg)
+		respondWithError(w, http.StatusForbidden, msg)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (cfg *apiConfig) createTokens(ctx context.Context, user database.User) (User, error) {
 	token, err := auth.MakeJWT(user.ID, cfg.secret, time.Hour)
 	if err != nil {
@@ -243,7 +292,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !match {
-		msg := fmt.Sprintf("Wrong password fo user %s", user.Email)
+		msg := fmt.Sprintf("Wrong password for user %s", user.Email)
 		log.Print(msg)
 		respondWithError(w, http.StatusUnauthorized, msg)
 		return
@@ -304,6 +353,58 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondWithJSON(w, http.StatusCreated, userWTokens)
+}
+
+func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
+	type UpdateUser struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		msg := fmt.Sprintf("Error getting token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		msg := fmt.Sprintf("Invalid token: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	updateUser := UpdateUser{}
+	err = decoder.Decode(&updateUser)
+	if err != nil {
+		msg := fmt.Sprintf("Error decoding user credentials: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+
+	hash, err := auth.HashPassword(updateUser.Password)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to hash password: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+
+	params := database.UpdateCredentialsParams{ID: userID, Email: updateUser.Email, HashedPassword: hash}
+	updated, err := cfg.dbQueries.UpdateCredentials(r.Context(), params)
+	if err != nil {
+		msg := fmt.Sprintf("Error updating user: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+
+	user := marshalUser(updated)
+	respondWithJSON(w, http.StatusOK, user)
 }
 
 func (cfg *apiConfig) refreshToken(w http.ResponseWriter, r *http.Request) {
@@ -440,7 +541,9 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", cfg.createChirp)
 	mux.HandleFunc("GET /api/chirps", cfg.getChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirp)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", cfg.deleteChirp)
 	mux.HandleFunc("POST /api/users", cfg.createUser)
+	mux.HandleFunc("PUT /api/users", cfg.updateUser)
 	mux.HandleFunc("POST /api/login", cfg.login)
 	mux.HandleFunc("POST /api/refresh", cfg.refreshToken)
 	mux.HandleFunc("POST /api/revoke", cfg.revokeToken)
