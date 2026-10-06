@@ -34,6 +34,7 @@ type apiConfig struct {
 	dbQueries      *database.Queries
 	platform       string
 	secret         string
+	apiKey         string
 }
 
 type errorBody struct {
@@ -45,16 +46,18 @@ type User struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	Email        string    `json:"email"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 	Token        string    `json:"token,omitempty"`
 	RefreshToken string    `json:"refresh_token,omitempty"`
 }
 
 func marshalUser(u database.User) User {
 	return User{
-		ID:        u.ID,
-		CreatedAt: u.CreatedAt,
-		UpdatedAt: u.UpdatedAt,
-		Email:     u.Email,
+		ID:          u.ID,
+		CreatedAt:   u.CreatedAt,
+		UpdatedAt:   u.UpdatedAt,
+		Email:       u.Email,
+		IsChirpyRed: u.IsChirpyRed,
 	}
 }
 
@@ -466,6 +469,61 @@ func (cfg *apiConfig) revokeToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (cfg *apiConfig) upgradeUserHook(w http.ResponseWriter, r *http.Request) {
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		msg := fmt.Sprintf("API key: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+	if apiKey != cfg.apiKey {
+		msg := "Invalid API key"
+		log.Print(msg)
+		respondWithError(w, http.StatusUnauthorized, msg)
+		return
+	}
+
+	type Payload struct {
+		UserID uuid.UUID `json:"user_id"`
+	}
+	type Upgrade struct {
+		Event string  `json:"event"`
+		Data  Payload `json:"data"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	upgrade := Upgrade{}
+	err = decoder.Decode(&upgrade)
+	if err != nil {
+		msg := fmt.Sprintf("Error decoding webhook data: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+	if upgrade.Event != "user.upgraded" {
+		msg := fmt.Sprintf("Unsupported event: %s", upgrade.Event)
+		log.Print(msg)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	rows, err := cfg.dbQueries.UpgradeUser(r.Context(), upgrade.Data.UserID)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to upgrade user: %s", err)
+		log.Print(msg)
+		respondWithError(w, http.StatusInternalServerError, msg)
+		return
+	}
+	if rows == 0 {
+		msg := fmt.Sprintf("No matching users %s", upgrade.Data.UserID)
+		log.Print(msg)
+		respondWithError(w, http.StatusNotFound, msg)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func healthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -527,11 +585,17 @@ func main() {
 		log.Fatal("SECRET must be set")
 	}
 
+	apiKey := os.Getenv("POLKA_KEY")
+	if apiKey == "" {
+		log.Fatal("POLKA_KEY must be set")
+	}
+
 	cfg := apiConfig{}
 	cfg.dbQueries = database.New(db)
 	cfg.fileserverHits.Store(0)
 	cfg.platform = os.Getenv("PLATFORM")
 	cfg.secret = secret
+	cfg.apiKey = apiKey
 
 	mux := http.NewServeMux()
 	mux.Handle("/app", cfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
@@ -547,6 +611,7 @@ func main() {
 	mux.HandleFunc("POST /api/login", cfg.login)
 	mux.HandleFunc("POST /api/refresh", cfg.refreshToken)
 	mux.HandleFunc("POST /api/revoke", cfg.revokeToken)
+	mux.HandleFunc("POST /api/polka/webhooks", cfg.upgradeUserHook)
 
 	mux.Handle("GET /admin/metrics", cfg.metrics())
 	mux.Handle("POST /admin/reset", cfg.reset())
