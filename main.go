@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -157,15 +158,27 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
-	rawChirps, err := cfg.dbQueries.GetChirps(r.Context())
+	authorID := r.URL.Query().Get("author_id")
+	var rawChirps []database.Chirp
+	var err error
+	if id, parseErr := uuid.Parse(authorID); parseErr == nil {
+		rawChirps, err = cfg.dbQueries.GetChirpsByAuthor(r.Context(), id)
+	} else {
+		rawChirps, err = cfg.dbQueries.GetChirps(r.Context())
+	}
 	if err != nil {
 		msg := fmt.Sprintf("Error getting chirps: %s", err)
 		log.Print(msg)
 		respondWithError(w, http.StatusInternalServerError, msg)
 		return
 	}
+	reverse := r.URL.Query().Get("sort") == "desc"
+	orderedChirps := slices.All(rawChirps)
+	if reverse {
+		orderedChirps = slices.Backward(rawChirps)
+	}
 	chirps := make([]Chirp, 0, len(rawChirps))
-	for _, c := range rawChirps {
+	for _, c := range orderedChirps {
 		chirps = append(chirps, marshalChirp(c))
 	}
 	respondWithJSON(w, http.StatusOK, chirps)

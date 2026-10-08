@@ -21,5 +21,10 @@ WHERE id = $1 AND user_id = $2;
 SELECT * FROM chirps
 ORDER BY created_at ASC;
 
+-- name: GetChirpsByAuthor :many
+SELECT * FROM chirps
+WHERE chirps.user_id = $1
+ORDER BY created_at ASC;
+
 -- name: DeleteChirps :exec
 DELETE FROM chirps;
